@@ -179,11 +179,42 @@ pip install -v --no-build-isolation --no-deps /path/to/flash_attn-2.8.3.post1.ta
 | 问题 | 修复 |
 |---|---|
 | 图捕获期 `FileNotFoundError: 'ninja'` | 启动脚本 `export PATH=venv/bin:$PATH` |
-| tilelang JIT 头冲突（pip nvcc 13.3 vs 自带 cccl） | CUDA_HOME 指向对齐后的工具链 |
+| tilelang JIT 头冲突（pip nvcc 13.3 vs 自带 cccl） | CUDA_HOME 指向对齐后的工具链（`pip install -U cuda-toolkit==13.3.1`） |
 | `RuntimeError: The memory capacity is unbalanced`（常驻服务占某卡 context 导致不对称） | `export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0`（降级为警告） |
-| 图捕获 OOM（实测 0.85 水位差 386M，恰为另一常驻服务多占的量） | `--mem-fraction-static 0.80` |
+| `--served-model-name` 传多个名字报 unrecognized arguments | SGLang **只收单值**（vLLM 多值语法不通用）；其对请求 model 字段宽容，留一个主名即可 |
 
-## 7. 启动命令（4×3090 实测可用）
+### 6.6 radix cache 前缀匹配卡死（unified tree）
+
+**现象**：运行一段时间后所有 chat 请求超时，但 `GET /metrics` 正常、`num_running_reqs=0`；py-spy 抓到调度器卡在 `unified_tree_core.py::_match_prefix_helper → radix_cache.py::__len__`。
+**原因**：fork 的 unified radix cache（同时管理 KV 前缀与 mamba 状态）树结构在特定请求序列后被撑坏，前缀匹配退化为超长遍历。
+**修复**：`--disable-radix-cache`。代价：多轮 agent 对话每轮全量 re-prefill（本机 prefill ~4000 tok/s，50K 上下文约 13s/轮，可接受）。此树 bug 建议报给 fork 作者。
+
+### 6.7 CUDA graph 捕获自动扩容楔死
+
+**现象**：重启后反复"加载 4 分钟 → 卡死 → watchdog 300s SIGKILL → 自动重启"循环；崩溃前日志显示 `Capturing batches (bs=72, avail_mem=0.91 GB)`。
+**原因**：sglang 按空闲显存自动扩展解码图列表（本例扩到 14 张图、bs=72），在仅剩 <1G 余量时 cudaMalloc 长时间挂起。
+**修复**：`--cuda-graph-max-bs-decode 16`（图内存需求大降，捕获余量恢复 3.6G+）。
+
+### 6.8 mamba 状态分配器组预分配爆炸
+
+**现象**：调度器每轮耗时 ~2s（64-token 小 prefill 以 31 tok/s 龟速推进），py-spy 显示卡在 `allocator/mamba.py::alloc_group_end`（对巨大分组做 `list(iter)` + `torch.cat`）。
+**原因**：`alloc_group_begin(len(waiting_queue))` 的组预分配在特定请求序列下组规模爆炸，每轮调度都要遍历/拼接整个分组，TP0 空转时其余 rank 在集合通信里陪等。
+**修复（mamba.py）**：旁路组预分配，退回逐请求 `alloc(1)` 路径：
+
+```python
+def alloc_group_begin(self, num_reqs: int):
+    self._alloc_iter = None
+    return          # sm86 patch: fall through to per-call alloc(1)
+    ...原预分配逻辑（不再执行）...
+```
+
+### 6.9 实流量瞬时 OOM：水位必须按真实峰值标定
+
+**现象**：`mem-fraction-static 0.86`（为撑满 262,144 KV 池）空载探针全部正常，但真实流量运行 **2 小时 48 分**后全 rank CUDA OOM——8192-token prefill 块需要 ~160MB 瞬时激活缓冲，而 0.86 只剩 15-20M。客户端表现为 502（撞上崩溃后的重启加载窗口）。
+**修复**：`--chunked-prefill-size 8192 → 4096`（瞬时峰值减半），水位定在 **0.84**（KV 池 245,312 token，留 1G+ 余量）。
+**教训：水位上限不能靠空载探针标定——必须以"真实流量的瞬时峰值"为准；KV 池 ≥ 客户端最大会话长度即可，盲目拉满反而制造 OOM。**
+
+## 7. 启动命令（4×3090 生产定稿）
 
 ```bash
 export SGLANG_BUILD_RUST_EXTS=none
@@ -191,7 +222,7 @@ export PATH=/path/to/venv/bin:$PATH
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 python -m sglang.launch_server \
   --model-path /path/to/Qwen3.8-Flash-Next-W4A16-Modular \
-  --served-model-name Qwen3.8-Flash-Next-W4A16 \
+  --served-model-name Qwen3.8-27B \
   --tp 4 \
   --ple-offload-embedding \
   --moe-a2a-backend none \
@@ -199,15 +230,41 @@ python -m sglang.launch_server \
   --linear-attn-decode-backend triton \
   --mamba-ssm-dtype bfloat16 \
   --context-length 262144 \
-  --mem-fraction-static 0.80 \
-  --chunked-prefill-size 8192 \
+  --mem-fraction-static 0.86 \
+  --max-total-tokens 262144 \
+  --disable-radix-cache \
+  --cuda-graph-max-bs-decode 16 \
+  --chunked-prefill-size 4096 \
   --reasoning-parser qwen3 --tool-call-parser qwen3_coder \
-  --host 0.0.0.0 --port 18089
+  --enable-metrics \
+  --host 0.0.0.0 --port 18080
 ```
 
-- `--tp 4` 与 0.80 水位：官方场景是单卡 96G（0.93）；4×24G 下水位由图捕获余量决定，卡上有其他常驻 context 越多越要降。
+每个数字的依据（都踩过坑）：
+
+- `--mem-fraction-static 0.86`：KV 池恰好达到 262,144 token 的最低水位（0.82→225K、0.84→245K、0.86→262K）。**sglang 对设不下的池静默缩容不报错**，必须核对启动日志 `KV Cache is allocated #tokens`；水位上限受"实流量瞬时峰值"约束（§6.9），不要盲目拉满。
+- `--max-total-tokens 262144`：KV 池与上下文等长，保证任何被接受的请求都不会因池满卡死（池小于会话长度时，请求会卡在 KV 分配直到客户端超时）。
+- `--disable-radix-cache`：§6.6；代价是多轮对话每轮全量 re-prefill（prefill 快，可接受）。
+- `--cuda-graph-max-bs-decode 16`：§6.7；解码并发 >16 的部分走 eager。
+- `--chunked-prefill-size 4096`：§6.9；瞬时激活峰值减半。
+- `--served-model-name` 只收单值；SGLang 对请求 model 字段宽容（客户端发旧模型名、大小写变体都能命中，换引擎时客户端零改动）。
+
+### 客户端上下文预算（重要）
+
+KV 池是「prompt + 输出」共享的，客户端（ZCode 等）的 context 配置必须满足：
+
+```
+客户端 context + 客户端 max_output ≤ KV 池 262,144
+```
+
+实测定稿：**context 212,000 / output 32,768**（212K + 32K = 244K，留 1K 安全边）。若客户端 context 配成 256K/262K，会话涨大后请求会卡在 KV 分配上直到客户端超时——这是实打实踩过的第三类卡死。
+
+运维备注：
+
 - **思考模式默认开启**（`reasoning_config default_enabled=True`），直出答案需请求级 `"chat_template_kwargs": {"enable_thinking": false}`。
-- 首个请求 ~6.6 tok/s 是 QSA/GDN Triton JIT 冷启动，第二个请求起进入稳态。
+- 首个请求 ~6.6 tok/s 是 QSA/GDN Triton JIT **冷启动**，之后进入稳态（~56 tok/s）；服务每次重启后都有一次冷启动。
+- 调度器如再次卡死（请求全部超时、GPU 空转）：systemd `Restart=always` 会在 watchdog 300s 后自动杀掉重启（约 5-6 分钟恢复）；也可手动 restart 立即恢复。
+- 建议用 systemd 托管（`LimitMEMLOCK=infinity`，PLE 表 ~95G pinned 内存需要），`Restart=always` + `--enable-metrics`。
 
 ## 8. 实测基准（4×3090）
 
@@ -225,10 +282,13 @@ python -m sglang.launch_server \
 
 - QSA 解码 SDPA 兜底为自定义路径（非官方内核）；装好 FA2 后应优先走 FA2。
 - 思考模式默认开；引擎侧无思考预算参数，靠请求级开关或 max_tokens 约束。
-- `mem-fraction-static 0.80` 偏保守（给常驻 context 让位），KV 池还有上调空间。
-- 未验证：262K 满长度压测、keep-mask 运行时裁剪（296→294+自愈集可再省显存）、多并发吞吐曲线、长稳。
-- fork 基线较旧（SGLang 0.5.6 + 回移的 #36497），上游合入后建议跟随升级。
+- **radix cache 已关闭**：多轮 agent 对话每轮全量 re-prefill（~4000 tok/s 下可接受），换来的是不会触发 §6.6 的树卡死。
+- **解码并发上限 16**（`--cuda-graph-max-bs-decode 16`），超出部分走 eager 路径。
+- **rerank 不在本机**：已外迁独立 x86 机器（CPU 推理），GPU 显存完全留给主模型，各卡对称。
+- 未验证：262K 满长度单请求实测、keep-mask 运行时裁剪（296→294+自愈集可再省显存）、多并发吞吐曲线、48h+ 长稳。
+- fork 基线较旧（SGLang 0.5.6 + 回移的 #36497），上游合入后建议跟随升级；§6.6/6.8 的两个上游 bug 建议反馈给 fork 作者。
 - 模型卡声称"weights ~45GB"实为显存占用口径（PLE 表 offload 到 RAM 后）；磁盘全量 98.3GB。
+- 内存驻留：PLE 表 bf16 ~95G + 模型加载缓存，宿主机 RAM 建议 ≥128G（本机 251G 实测占用 ~160G 峰值）。
 
 ## 10. 参考
 
