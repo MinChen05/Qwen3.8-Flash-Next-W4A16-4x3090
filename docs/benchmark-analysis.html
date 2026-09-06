@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Qwen3.8-Flash-Next W4A16 全GPU部署分析 — 4×3090 实战记录</title>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+<style>
+  :root{
+    --bg:#0b0f1a; --panel:#121829; --panel2:#0e1422; --line:#1e2a45;
+    --tx:#e6ecff; --tx2:#8fa3c8; --tx3:#5d7099;
+    --gold:#f5c451; --blue:#4d8dff; --cyan:#39d3c3; --green:#3ecf8e; --red:#ff6b6b; --purple:#a37fff; --orange:#ff9f43;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:var(--bg);color:var(--tx);font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.6;padding-bottom:60px}
+  .wrap{max-width:1180px;margin:0 auto;padding:0 24px}
+  header{padding:52px 0 26px;border-bottom:1px solid var(--line);
+    background:radial-gradient(1200px 400px at 20% -10%, rgba(77,141,255,.14), transparent), radial-gradient(900px 300px at 85% -20%, rgba(245,196,81,.10), transparent)}
+  .tag{display:inline-block;font-size:12px;letter-spacing:.14em;color:var(--gold);border:1px solid rgba(245,196,81,.4);border-radius:20px;padding:3px 14px;margin-bottom:14px}
+  h1{font-size:32px;font-weight:700;letter-spacing:.01em}
+  h1 .hl{background:linear-gradient(90deg,var(--gold),var(--orange));-webkit-background-clip:text;background-clip:text;color:transparent}
+  .sub{color:var(--tx2);margin-top:10px;font-size:14.5px;max-width:900px}
+  .meta{margin-top:14px;font-size:12.5px;color:var(--tx3)}
+  .kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:-28px 0 8px}
+  .kpi{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:14px;padding:18px 20px;position:relative;overflow:hidden}
+  .kpi::after{content:"";position:absolute;inset:0;background:radial-gradient(300px 80px at 90% 0%, rgba(255,255,255,.05), transparent)}
+  .kpi .v{font-size:30px;font-weight:700;font-family:"SF Mono",Menlo,monospace}
+  .kpi .u{font-size:13px;color:var(--tx2);font-weight:400;margin-left:2px}
+  .kpi .l{font-size:12.5px;color:var(--tx2);margin-top:4px}
+  .kpi.g .v{color:var(--gold)} .kpi.b .v{color:var(--blue)} .kpi.c .v{color:var(--cyan)} .kpi.gn .v{color:var(--green)}
+  section{margin-top:44px}
+  h2{font-size:20px;font-weight:700;padding-left:12px;border-left:4px solid var(--gold);margin-bottom:6px}
+  .desc{color:var(--tx2);font-size:13.5px;margin-bottom:16px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:8px 16px 16px}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  .chart{width:100%;height:360px}
+  .chart.tall{height:420px}
+  table{width:100%;border-collapse:collapse;font-size:13.5px;margin-top:6px}
+  th,td{padding:9px 12px;text-align:left;border-bottom:1px solid var(--line)}
+  th{color:var(--tx3);font-weight:600;font-size:12.5px;letter-spacing:.05em}
+  td.num{font-family:"SF Mono",Menlo,monospace}
+  .win{color:var(--gold);font-weight:700}
+  .dim{color:var(--tx3)}
+  .note{font-size:12.5px;color:var(--tx3);margin-top:8px}
+  .flow{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-top:14px}
+  .fstep{background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:14px 12px;position:relative}
+  .fstep .no{font-size:11px;color:var(--red);font-weight:700;letter-spacing:.1em}
+  .fstep .t{font-size:13.5px;font-weight:600;margin:6px 0 4px}
+  .fstep .d{font-size:12px;color:var(--tx2)}
+  .fstep .fix{margin-top:8px;font-size:12px;color:var(--green)}
+  .fstep::after{content:"→";position:absolute;right:-11px;top:44%;color:var(--tx3);font-size:14px}
+  .fstep:last-child::after{display:none}
+  .arch{display:flex;flex-direction:column;gap:12px;margin-top:14px}
+  .arch-row{display:flex;gap:12px;align-items:stretch}
+  .abox{border:1px solid var(--line);border-radius:12px;padding:12px 16px;background:var(--panel2);flex:1}
+  .abox h4{font-size:13px;color:var(--tx2);font-weight:600;margin-bottom:6px}
+  .abox .items{display:flex;flex-wrap:wrap;gap:8px}
+  .chip{font-size:12px;padding:4px 10px;border-radius:8px;background:rgba(77,141,255,.12);color:#9dc0ff;border:1px solid rgba(77,141,255,.25)}
+  .chip.cpu{background:rgba(62,207,142,.10);color:#7fe6bd;border-color:rgba(62,207,142,.3)}
+  .chip.warn{background:rgba(255,107,107,.10);color:#ff9c9c;border-color:rgba(255,107,107,.3)}
+  .arrow{align-self:center;color:var(--tx3);font-size:18px}
+  code{font-family:"SF Mono",Menlo,monospace;font-size:12px;background:#0a0e19;border:1px solid var(--line);border-radius:8px;display:block;padding:14px 16px;white-space:pre;overflow-x:auto;color:#b8c8e8;line-height:1.7;margin-top:10px}
+  code .c{color:#5d7099} code .k{color:#f5c451}
+  .verdict{background:linear-gradient(135deg,rgba(245,196,81,.08),rgba(255,159,67,.04));border:1px solid rgba(245,196,81,.35);border-radius:14px;padding:20px 22px;margin-top:16px}
+  .verdict h3{font-size:16px;color:var(--gold);margin-bottom:8px}
+  .verdict p{font-size:13.5px;color:var(--tx2)}
+  ul.clean{list-style:none;margin-top:8px}
+  ul.clean li{padding:5px 0;font-size:13.5px;color:var(--tx2);border-bottom:1px dashed rgba(30,42,69,.8)}
+  ul.clean li b{color:var(--tx)}
+  @media (max-width:900px){.kpis{grid-template-columns:1fr 1fr}.grid2{grid-template-columns:1fr}.flow{grid-template-columns:1fr 1fr}}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <div class="tag">DEPLOYMENT ANALYSIS · 2026-09-06</div>
+    <h1>Qwen3.8-Flash-Next <span class="hl">W4A16 全GPU部署</span>实战分析</h1>
+    <div class="sub">180B-A6B MoE（296/512 专家裁剪版）· SGLang fork + 运行时专家裁剪 · 4×RTX 3090 TP4 无 NVLink · 从 98.3GB 跨境下载到六连崩修复的全记录与基准数据</div>
+    <div class="meta">机器：H3C R5300 G6 · 4×3090 (96GB) · 251GB RAM · 驱动 580.159.03 · 生产对照：vLLM Qwen3.8-27B-W8A8-MM + MTP @ 18080</div>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="kpis">
+    <div class="kpi g"><div class="v">56.2<span class="u">tok/s</span></div><div class="l">短请求解码 · 500tok 中文 ×3 均值</div></div>
+    <div class="kpi c"><div class="v">40.9<span class="u">tok/s</span></div><div class="l">95K 上下文解码（QSA 稀疏）</div></div>
+    <div class="kpi b"><div class="v">3934<span class="u">tok/s</span></div><div class="l">95K prefill（ik offload 的 6 倍）</div></div>
+    <div class="kpi gn"><div class="v">262K<span class="u">+视觉✓</span></div><div class="l">全量上下文 · 视觉塔 FP16 实测识别准确</div></div>
+  </div>
+
+  <section>
+    <h2>① 核心基准对比：三种部署形态</h2>
+    <div class="desc">同一台 4×3090、同一 prompt（500 tok 中文，enable_thinking=false）。"旧 ik offload" = UD-Q4_K_XL GGUF + MoE 专家 CPU offload；"W4A16" = 本方案。</div>
+    <div class="grid2">
+      <div class="card"><div id="c1" class="chart"></div></div>
+      <div class="card"><div id="c2" class="chart"></div></div>
+    </div>
+    <div class="card" style="margin-top:16px"><div id="c3" class="chart"></div></div>
+    <div class="note">* 27B 生产的 95K prefill 数字为 08-31 SGLang FP8 时期历史参考值（2608-3000 t/s），本轮未复测；W4A16 prefill 为实测（95212 tok / 24.2s）。95K 解码对比中的"ik 纯GPU"为 Flash-Next 无视觉 128K 形态（2026-09-05 实测 41.3）。</div>
+  </section>
+
+  <section>
+    <h2>② Flash-Next 在这台机器上的速度演进</h2>
+    <div class="desc">四个阶段的短请求解码速度（同口径）。"切 27B"阶段的空白期无 Flash-Next 数据。</div>
+    <div class="card"><div id="c4" class="chart tall"></div></div>
+    <table>
+      <tr><th>阶段</th><th>形态</th><th class="num">短请求 tok/s</th><th class="num">95K+ 解码</th><th>视觉</th><th>上下文上限</th></tr>
+      <tr><td>08-29 ~ 09-01 生产期</td><td>ik llama.cpp · 专家 offload</td><td class="num">36.5 - 40.2</td><td class="num">46K=28.1 / 165K=18.1</td><td>✓</td><td>256K</td></tr>
+      <tr><td>09-02 最后实验</td><td>ik + MTP sidecar（无视觉）</td><td class="num dim">—</td><td class="num">148K=20-24</td><td>✗</td><td>200K</td></tr>
+      <tr><td>09-05 ik HEAD 重编译</td><td>offload + depth-constant attn</td><td class="num">35.6 - 38.4</td><td class="num">95K=30.5 / 159K=28.1</td><td>✓</td><td>256K</td></tr>
+      <tr><td>09-05 纯 GPU（无视觉）</td><td>ik · ncmoe=0 · ub256</td><td class="num">53.2 - 55.0</td><td class="num">95K=41.3</td><td>✗</td><td>128K</td></tr>
+      <tr><td><b>09-06 W4A16（本方案）</b></td><td><b>sglang fork · 全 GPU</b></td><td class="num win">55.9 - 56.4</td><td class="num win">95K=40.9</td><td class="win">✓</td><td class="win">262K</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>③ 六连崩排障实录</h2>
+    <div class="desc">全部崩点都集中在"作者只在 sm89+/Blackwell 单卡验证过"的盲区。修复补丁已留档在 llm:/home/jyx/src/sglang-fn（qwen4_exp.py 备份 .bak-fp8sm86）。</div>
+    <div class="flow">
+      <div class="fstep"><div class="no">CRASH 1</div><div class="t">PLE 查表内核 fp8e4nv</div><div class="d">Triton fp8e4nv 需要 sm89+，3090/sm86 拒编</div><div class="fix">✓ CPU 分块反量化 → bf16 pinned</div></div>
+      <div class="fstep"><div class="no">CRASH 2</div><div class="t">bf16 全表 GPU OOM</div><div class="d">23.84G/卡塞不下；4 rank 全量转换又触发系统 OOM killer</div><div class="fix">✓ 2M 行分块 + device="cpu" 显式</div></div>
+      <div class="fstep"><div class="no">CRASH 3</div><div class="t">加载器护栏误拦</div><div class="d">"fp8 PLE auto-switch is unsupported" 硬失败</div><div class="fix">✓ pinned 跳过 fp8 切换走转换拷贝</div></div>
+      <div class="fstep"><div class="no">CRASH 4</div><div class="t">ninja 缺失 + cccl 冲突</div><div class="d">JIT 编译链断裂；pip nvcc13.3 vs cccl13.0 头不匹配</div><div class="fix">✓ venv PATH + 工具链对齐 13.3.1</div></div>
+      <div class="fstep"><div class="no">CRASH 5</div><div class="t">QSA 解码落 FA4 cute</div><div class="d">无 FA2 时落到 Blackwell 专用 FA4，sm86 MLIR 崩</div><div class="fix">✓ sm&lt;9 返回 None → PyTorch SDPA 兜底</div></div>
+      <div class="fstep"><div class="no">CRASH 6</div><div class="t">图捕获 OOM + 均衡检查</div><div class="d">GPU1 被 reranker context 多占 956M，差 386M</div><div class="fix">✓ mem-fraction 0.80 + 检查降为警告</div></div>
+    </div>
+    <div class="note">另：experts-L14.safetensors 出现"大小精确、sha256 不符"的混合续传损坏，全量 64 文件对照 HF 官方 sha256 后重下修复。思考模式默认开启，基准统一 enable_thinking=false；首请求 6.6 t/s 为 QSA/GDN Triton JIT 冷启动，非稳态。</div>
+  </section>
+
+  <section>
+    <h2>④ 运行时架构（补丁后）</h2>
+    <div class="card" style="padding:18px">
+      <div class="arch">
+        <div class="arch-row">
+          <div class="abox"><h4>客户端 → 18089</h4><div class="items"><span class="chip">sglang fork (ours/main)</span><span class="chip">TP4 · SGLang 调度</span><span class="chip">radix cache</span><span class="chip">reasoning/tool parser</span></div></div>
+        </div>
+        <div class="arrow" style="text-align:center">↓</div>
+        <div class="arch-row">
+          <div class="abox" style="border-color:rgba(77,141,255,.45)"><h4>GPU 0-3（各 ~21.6/24 GB）</h4><div class="items"><span class="chip">W4A16 权重 13.5G/卡（Marlin int4）</span><span class="chip">296/512 专家 全GPU</span><span class="chip">KV + CUDA Graph</span><span class="chip">视觉塔 FP16</span></div></div>
+        </div>
+        <div class="arch-row">
+          <div class="abox" style="border-color:rgba(62,207,142,.4)"><h4>RAM（251G，PLE 表 CPU pinned）</h4><div class="items"><span class="chip cpu">PLE ngram 表 bf16 ~95G（4 rank pinned）</span><span class="chip cpu">QSA 查表内核走 bf16 分支</span><span class="chip cpu">--ple-offload-embedding</span></div></div>
+        </div>
+        <div class="arrow" style="text-align:center">↓</div>
+        <div class="arch-row">
+          <div class="abox" style="border-color:rgba(255,107,107,.35)"><h4>已知妥协</h4><div class="items"><span class="chip warn">QSA 解码走 SDPA 兜底（无 FA2/FA4）</span><span class="chip warn">思考默认开，需请求级关闭</span><span class="chip warn">nohup 手跑未 systemd 化</span><span class="chip warn">mem-fraction 0.80（给 reranker 让位）</span></div></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>⑤ 下载与数据工程侧记</h2>
+    <div class="grid2">
+      <div class="card" style="padding:16px">
+        <h4 style="font-size:14px;margin:8px 0 6px">98.3 GB · 74 文件 · 3 天通道演化</h4>
+        <ul class="clean">
+          <li><b>14 backbone 分片 61.9G</b>（含 FP16 视觉塔 + MTP 层）+ <b>48 专家分片 36.3G</b></li>
+          <li><b>代理矩阵</b>：v2rayN 订阅过期 → 免费节点限并发 2MB/s → 锦云 Clash 7897（日本1 最优 2.2MB/s 单连，4 并发 ~5MB/s）</li>
+          <li><b>可靠下载器</b>：hf_transfer 不走代理 / python SSL 断 — 最终 = curl -C - 续传 + 60 次重试 + 6 并发，Mac 本地落盘</li>
+          <li><b>同步</b>：macOS openrsync 阉割（无 --append-verify）→ tar over ssh 增量标记表</li>
+          <li><b>数据完整性</b>：L14"大小对 sha 错"续传损坏 → 64 文件全量对照 HF 官方 sha256，重下修复</li>
+        </ul>
+      </div>
+      <div class="card" style="padding:16px">
+        <h4 style="font-size:14px;margin:8px 0 6px">复现命令（llm 上，端口 18089 测试位）</h4>
+<code><span class="c"># 补丁:qwen4_exp.py(3处)+qwen_sparse_attn_backend.py(SDPA兜底)</span>
+<span class="k">python</span> -m sglang.launch_server \
+  --model-path /home/jyx/models/Qwen3.8-Flash-Next-W4A16-Modular \
+  --served-model-name Qwen3.8-Flash-Next-W4A16 \
+  --tp 4 \
+  --ple-offload-embedding \
+  --moe-a2a-backend none \
+  --linear-attn-prefill-backend triton \
+  --linear-attn-decode-backend triton \
+  --mamba-ssm-dtype bfloat16 \
+  --context-length 262144 \
+  --mem-fraction-static 0.80 \
+  --chunked-prefill-size 8192 \
+  --reasoning-parser qwen3 --tool-call-parser qwen3_coder \
+  --host 0.0.0.0 --port 18089
+<span class="c"># 请求需带 chat_template_kwargs:{enable_thinking:false} 直出</span></code>
+        <div class="note">补丁备份 qwen4_exp.py.bak-fp8sm86；生产切换属用户拍板项——当前 18080 生产（27B）未动。</div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>⑥ 结论与决策建议</h2>
+    <div class="verdict">
+      <h3>256K + 视觉 + 180B 深度 + 27B 级速度：四项全部达成</h3>
+      <p>W4A16 全GPU 路线在 4×3090 上验证成功——这是 Flash-Next 首次在这台机器上同时满足四项能力。ik offload 形态（补丁后仍为 38 t/s 级）已被全面超越，可正式退役为应急备份。</p>
+      <ul class="clean">
+        <li><b>建议 A（转正观察）</b>：sglang 常驻另一端口与 27B 并行运行数日，观察长会话稳定性、显存水位、JIT 首请延迟，数据无虞后切换生产。</li>
+        <li><b>建议 B（立即转正）</b>：18080 直接切 sglang（端口改 18080 + 客户端别名已兼容），27B 服务保留秒级回退。</li>
+        <li><b>未验证项</b>：262K 满长度压测、keep-mask 运行时裁剪（296→294+自愈集）、多并发吞吐曲线、48h 稳定性。</li>
+        <li><b>风险</b>：QSA 解码 SDPA 兜底为非官方路径；作者侧后续更新（上游 PR #36497 合入）可能带来更正面的兼容。</li>
+      </ul>
+    </div>
+  </section>
+</div>
+
+<script>
+const AX = {axisLine:{lineStyle:{color:'#1e2a45'}}, axisLabel:{color:'#8fa3c8',fontSize:12}, splitLine:{lineStyle:{color:'rgba(30,42,69,.6)'}}};
+const TIP = {trigger:'axis', backgroundColor:'#121829', borderColor:'#1e2a45', textStyle:{color:'#e6ecff',fontSize:12}};
+function mk(id, opt){ const c = echarts.init(document.getElementById(id)); c.setOption(opt); window.addEventListener('resize',()=>c.resize()); }
+
+/* 图1 短请求 */
+mk('c1', {
+  title:{text:'短请求解码速度（500 tok 中文，越快越好）',left:'center',textStyle:{color:'#e6ecff',fontSize:14}},
+  tooltip:TIP, grid:{left:56,right:24,top:56,bottom:56},
+  xAxis:{type:'category',data:['旧 ik offload\n(ik HEAD)','27B 生产\n(vLLM W8A8+MTP)','W4A16 全GPU\n(sglang fork)'],...AX},
+  yAxis:{type:'value',name:'tok/s',nameTextStyle:{color:'#8fa3c8'},min:0,max:70,...AX},
+  series:[{type:'bar',barWidth:52,data:[
+    {value:37.4,itemStyle:{color:'#5d7099'}},
+    {value:55.3,itemStyle:{color:'#4d8dff'}},
+    {value:56.2,itemStyle:{color:'#f5c451'}}],
+    label:{show:true,position:'top',color:'#e6ecff',fontSize:14,fontWeight:'bold',formatter:'{c}'},
+    markLine:{symbol:'none',lineStyle:{color:'#ff6b6b',type:'dashed'},label:{color:'#ff6b6b',formatter:'27B 基准 55.3'},data:[{yAxis:55.3}]}}],
+  ...(()=>({}))()
+});
+
+/* 图2 95K 解码 */
+mk('c2', {
+  title:{text:'95K 上下文解码速度',left:'center',textStyle:{color:'#e6ecff',fontSize:14}},
+  tooltip:TIP, grid:{left:56,right:24,top:56,bottom:70},
+  xAxis:{type:'category',data:['ik offload\n(带视觉·256K)','ik 纯GPU\n(无视觉·128K上限)','W4A16 全GPU\n(带视觉·262K)'],...AX,axisLabel:{color:'#8fa3c8',fontSize:11,interval:0}},
+  yAxis:{type:'value',name:'tok/s',nameTextStyle:{color:'#8fa3c8'},min:0,max:55,...AX},
+  series:[{type:'bar',barWidth:52,data:[
+    {value:30.5,itemStyle:{color:'#5d7099'}},
+    {value:41.3,itemStyle:{color:'#39d3c3'}},
+    {value:40.9,itemStyle:{color:'#f5c451'}}],
+    label:{show:true,position:'top',color:'#e6ecff',fontSize:14,fontWeight:'bold',formatter:'{c}'}}]
+});
+
+/* 图3 95K prefill 对数轴 */
+mk('c3', {
+  title:{text:'95K prefill 吞吐（log 轴）— 压缩/吞长文档能力',left:'center',textStyle:{color:'#e6ecff',fontSize:14}},
+  tooltip:TIP, grid:{left:64,right:24,top:56,bottom:56},
+  xAxis:{type:'category',data:['旧 ik offload\n(实测 657)','27B 生产\n(历史参考 ~2800)','W4A16 全GPU\n(实测 3934)'],...AX,axisLabel:{color:'#8fa3c8',fontSize:11,interval:0}},
+  yAxis:{type:'log',logBase:10,name:'tok/s (log)',nameTextStyle:{color:'#8fa3c8'},min:100,...AX},
+  series:[{type:'bar',barWidth:52,data:[
+    {value:657,itemStyle:{color:'#5d7099'}},
+    {value:2800,itemStyle:{color:'#4d8dff'},label:{show:true,position:'top',color:'#8fa3c8',fontSize:11,formatter:'历史参考'}},
+    {value:3934,itemStyle:{color:'#f5c451'}}],
+    label:{show:true,position:'top',color:'#e6ecff',fontSize:14,fontWeight:'bold',formatter:'{c}'}}]
+});
+
+/* 图4 演进时间线 */
+const days=['08-29','08-31','09-02','09-05','09-05','09-06'];
+mk('c4', {
+  title:{text:'Flash-Next 短请求速度演进（本机实测）',left:'center',textStyle:{color:'#e6ecff',fontSize:14}},
+  tooltip:{...TIP,formatter:(p)=>`${p.name}<br/>${p.value} tok/s<br/>${p.data.note}`},
+  grid:{left:56,right:110,top:40,bottom:70},
+  xAxis:{type:'category',data:['ik 首部署\noffload 256K','全路线定稿\noffload 最优','MTP sidecar\n(无视觉,长文)','ik HEAD\n重编译+长文修复','ik 纯GPU\n(无视觉·128K)','W4A16 全GPU\n(262K+视觉)'],...AX,axisLabel:{color:'#8fa3c8',fontSize:10.5,interval:0}},
+  yAxis:{type:'value',name:'tok/s',nameTextStyle:{color:'#8fa3c8'},min:0,max:70,...AX},
+  series:[
+    {type:'line',data:[{value:37.4,note:'3 轮均值 35.6/38.1/38.4'},{value:40.2,note:'layer split 最优形态'},{value:null,note:'已切 27B，无数据'},{value:37.0,note:'35.6/38.1/38.4 均值'},{value:54.2,note:'53.2/55.0/54.5，无视觉'},{value:56.2,note:'55.9/56.4/56.3，262K+视觉'}],
+     lineStyle:{color:'#f5c451',width:3},itemStyle:{color:'#f5c451'},symbolSize:10,
+     label:{show:true,position:'right',color:'#e6ecff',fontSize:13,fontWeight:'bold',formatter:(p)=>p.value?p.value+'':''},
+     areaStyle:{color:{type:'linear',x:0,y:0,x2:0,y2:1,colorStops:[{offset:0,color:'rgba(245,196,81,.25)'},{offset:1,color:'rgba(245,196,81,0)'}]}}}
+  ]
+});
+</script>
+</body>
+</html>
